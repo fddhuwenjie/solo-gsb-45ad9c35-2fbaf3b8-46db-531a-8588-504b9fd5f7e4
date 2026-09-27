@@ -1,0 +1,24 @@
+services:
+  braille-pager:
+    build: .
+    image: braille-pager:latest
+    container_name: braille-pager
+    ports:
+      - "${BRAILLE_PORT:-8080}:8080"
+    environment:
+      BRAILLE_DATA_DIR: /data
+      BRAILLE_HOST: 0.0.0.0
+      BRAILLE_PORT: "8080"
+      BRAILLE_MAX_GRAPHEMES: "${BRAILLE_MAX_GRAPHEMES:-200000}"
+    volumes:
+      - braille-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  braille-data:

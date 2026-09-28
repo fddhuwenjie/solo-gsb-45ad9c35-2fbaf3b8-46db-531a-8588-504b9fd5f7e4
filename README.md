@@ -125,6 +125,7 @@ curl -s -X POST http://localhost:8080/plan \
 | `GET  /documents/{doc}/finalizations/{n}/pages.svg` | **可打印 SVG**（每页一框、实点、页码） |
 | `GET  /documents/{doc}/finalizations/{n}/replay.json` | **复演请求**（自包含，重放得到同一布局） |
 | `POST /documents/{doc}/finalizations/{n}/verify` | **压印样张回读核验**（只读，不改定稿） |
+| `POST /documents/{doc}/finalizations/{n}/compensate` | **故障压针补偿**（只读定稿，不重新分页/改写） |
 | `POST /documents/{doc}/finalizations/diff/compare` | **定稿修订影响对比**（只读两份定稿，不重新规划） |
 
 ```bash
@@ -171,6 +172,98 @@ curl -s -X POST http://localhost:8080/documents/book/finalizations/1/verify \
   `perfect=true` 且 `discrepancy_count=0` 表示样张与定稿完全一致。
 
 > 实测页/行 JSON 也接受简写形式：页可直接给行数组（`"pages": [[[mask,...],...]]`）。
+
+### `POST /documents/{doc}/finalizations/{n}/compensate` — 故障压针补偿
+
+压印机部分压针损坏时，把纸张旋转 180° 可用对侧的好针打出同一个凸点：
+半翻转把点号列上下左右对调（`1↔6、2↔5、3↔4`），页内坐标反变换为
+`device_line = lines_per_page + 1 - line`、
+`device_col = cells_per_line + 1 - col`、`device_dot = 7 - dot`。
+
+接口针对**已定稿**修订（未定稿返回 `404`），只读取该定稿的**逐页单元**，
+**不重新分页、不改写定稿**。请求给出：
+
+| 字段 | 说明 |
+| --- | --- |
+| `working_dots` | 仍可工作的设备压针点号列表（`1..6` 整数、不可重复；空列表合法但非空定稿必然 `409`） |
+| `orientations` | 允许的纸张方向，仅可取 `normal`、`rotate_180`；非空、不可重复，先后次序仅回显 |
+| `max_passes` | 最多允许压印遍数，整数 `1..2`（物理方向只有两种，第三遍不可能再补出任何凸点） |
+
+非法点号、未知/重复方向、遍数越界、类型错误（含布尔值）一律 `400 invalid_request`。
+
+搜索与裁决：
+
+- 先把 `rotate_180` 下的页内行列与点号按上述物理坐标反变换，再按
+  **遍数最少**搜索方向组合；等长组合按固定次序 **`normal` 先于 `rotate_180`**
+  破平局（与请求里的排列次序无关）。
+- 每个目标凸点只分配给**首个可驱动它的遍次**（normal 能用就不留给 rotate），
+  因此第一遍会压掉它能覆盖的全部凸点，旋转遍只补剩余凸点。
+- 输出逐遍的**设备坐标掩码**（`pages[].lines[].cells[]`：
+  `device_line/device_col/device_dots/mask`）及每个设备单元的**原页行列映射**
+  （`source.page/line/col/dots`，带字素与码点区间）。各遍掩码反变换合并后
+  **必须与原定稿逐点相等**——不缺点也**不能多压**，接口在应答前自行校验这一不变量。
+
+无可行组合时返回 **`409 conflict`**：
+
+- `reason=unreachable_dot`：某凸点在所有允许方向下都没有可用针（与遍数预算无关）；
+- `reason=max_passes_exceeded`：各点单独都可达，但覆盖全部点所需遍数
+  （`required_passes`）超过 `max_passes`。
+- 响应列出**首个不可达单元**（`first_unreachable_cell`：页/行/列/点号/预期掩码/
+  字素码点区间）、**缺失点号** `missing_dots`（全局不可达点号集合，去重升序）和
+  **已验证页前缀** `verified_prefix`（该单元之前各页的页坐标重建、页数与凸点数）。
+
+8080 端口调用示例（先创建并定稿修订 1，见上文）：
+
+```bash
+# 压针 3 损坏，允许正向 + 旋转、最多 2 遍
+curl -s -X POST http://localhost:8080/documents/book/finalizations/1/compensate \
+  -H 'Content-Type: application/json' -d '{
+    "working_dots": [1, 2, 4, 5, 6],
+    "orientations": ["normal", "rotate_180"],
+    "max_passes": 2
+  }'
+```
+
+成功响应（节选）：
+
+```json
+{
+  "document_id": "book", "revision_no": 1, "status": "compensated",
+  "working_dots": [1, 2, 4, 5, 6],
+  "orientations": ["normal", "rotate_180"],
+  "max_passes": 2, "pass_count": 2, "target_dot_count": 50,
+  "passes": [
+    {"pass": 1, "orientation": "normal", "dot_count": 39, "pages": [
+      {"page": 1, "lines": [
+        {"device_line": 1, "cells": [
+          {"device_line": 1, "device_col": 1, "device_dots": [1, 2, 5],
+           "mask": 19,
+           "source": {"page": 1, "line": 1, "col": 1, "dots": [1, 2, 5],
+                      "char_start": 0, "char_end": 1,
+                      "grapheme_start": 0, "grapheme_end": 1}}]}]}]},
+    {"pass": 2, "orientation": "rotate_180", "dot_count": 11, "pages": [
+      {"page": 1, "lines": [
+        {"device_line": 2, "cells": [
+          {"device_line": 2, "device_col": 3, "device_dots": [4],
+           "mask": 8,
+           "source": {"page": 1, "line": 2, "col": 8, "dots": [3]}}]}]}]}
+  ]
+}
+```
+
+不可行时（仅允许正向且压针 3 损坏）：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  http://localhost:8080/documents/book/finalizations/1/compensate \
+  -H 'Content-Type: application/json' -d '{
+    "working_dots": [1, 2, 4, 5, 6],
+    "orientations": ["normal"], "max_passes": 1
+  }'
+# 409
+```
+
+> 该接口为纯只读计算：不触碰修订只追加约束，定稿摘要与导出物的哈希保持不变。
 
 ### `POST /documents/{doc}/finalizations/diff/compare` — 定稿修订影响对比
 
@@ -315,6 +408,9 @@ python3 -m unittest discover -s tests -v
 区间整体移动/超宽、双面/装订槽/空白补页、xref 渲染与不动点收敛、键序无关确定性、
 CRLF/组合字字素、仅追加存储、去重、冲突不可定稿、不可变导出物，合成历史的页码振荡，
 以及压印样张回读的最小编辑对齐（漏印不级联）、凸点差异/额外/漏印清单、结构非法与 HTTP 接口，
+还有故障压针补偿（180° 物理反变换、最少方向组合、normal/rotate_180 固定破平局、
+每点只进首个可用遍次、设备坐标掩码与原页行列映射、合并不多不缺、不可达点/遍数超限 409
+与已验证页前缀、非法点号/重复方向/遍数越界 400、只读不改定稿与 HTTP 接口），
 还有定稿修订影响对比的字素最小编辑对齐（仅按字素文本判等、坐标移位不误判、
 重复文本稳定、同代价匹配→替换→删除→插入、前后缀裁剪不改变操作流、
 束带 DP 与完整表引用逐字一致、长重复正文单字修订不误拒、高差异长文仍拒绝）、

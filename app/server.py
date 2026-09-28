@@ -5,6 +5,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import config
+from .compensation import compensate
 from .diff import compare_finalizations
 from .errors import Conflict, InputError, NotFound
 from .exporter import export_all
@@ -75,7 +76,14 @@ class Handler(BaseHTTPRequestHandler):
         elif isinstance(exc, NotFound):
             self._send(404, {"error": "not_found", "message": str(exc)})
         elif isinstance(exc, Conflict):
-            self._send(409, {"error": "conflict", "message": str(exc)})
+            details = exc.args[0] if exc.args else None
+            if isinstance(details, dict):
+                body = {"error": "conflict", **details}
+            else:
+                body = {"error": "conflict",
+                        "message": str(details) if details is not None
+                        else "conflict"}
+            self._send(409, body)
         else:
             self._send(500, {"error": "internal",
                              "message": f"{type(exc).__name__}: {exc}"})
@@ -151,6 +159,11 @@ class Handler(BaseHTTPRequestHandler):
                     and parts[4] == "verify":
                 self._verify_readback(urllib.parse.unquote(parts[1]),
                                       int(parts[3]))
+            elif len(parts) == 5 and parts[0] == "documents" \
+                    and parts[2] == "finalizations" \
+                    and parts[4] == "compensate":
+                self._compensate_pins(urllib.parse.unquote(parts[1]),
+                                      _path_revision(parts[3]))
             else:
                 self._send(404, {"error": "not_found", "path": parsed.path})
         except Exception as exc:  # noqa: BLE001
@@ -280,6 +293,22 @@ class Handler(BaseHTTPRequestHandler):
             **report,
         })
 
+    def _compensate_pins(self, doc_id, no):
+        store = get_store()
+        # 404 unless the revision is finalized; the finalization is only
+        # read, never re-paginated or rewritten.
+        store.get_finalization(doc_id, no)
+        rev = store.get_revision(doc_id, no)
+        payload = self._read_json()
+        report = compensate(rev["layout"], rev["request"], payload)
+        self._send(200, {
+            "document_id": doc_id,
+            "revision_no": no,
+            "request_sha256": rev["request_sha256"],
+            "layout_sha256": rev["layout_sha256"],
+            **report,
+        })
+
     def _compare_finalizations(self, doc_id):
         store = get_store()
         payload = self._read_json()
@@ -304,6 +333,16 @@ def _revision_no(payload, key):
     value = payload.get(key)
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise InputError(f"{key} must be a positive integer revision number")
+    return value
+
+
+def _path_revision(raw):
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 0
+    if value < 1:
+        raise InputError("revision number in path must be a positive integer")
     return value
 
 
